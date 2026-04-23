@@ -21,6 +21,8 @@ EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
 EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
 EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
 BOT_AUTO_REPLY = os.getenv("BOT_AUTO_REPLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+BOT_REPLY_COOLDOWN_SECONDS = int(os.getenv("BOT_REPLY_COOLDOWN_SECONDS", "45"))
+_LAST_REPLY_BY_CHAT: Dict[str, float] = {}
 
 STATUS_MAP = {
     "novo": "recebido",
@@ -161,6 +163,22 @@ def _normalize_jid_to_number(jid: str) -> str:
     return digits
 
 
+def _is_private_jid(jid: str) -> bool:
+    j = (jid or "").strip().lower()
+    return j.endswith("@s.whatsapp.net")
+
+
+def _chat_on_cooldown(chat_id: str) -> bool:
+    if not chat_id:
+        return False
+    now_ts = datetime.now().timestamp()
+    last = _LAST_REPLY_BY_CHAT.get(chat_id, 0.0)
+    if now_ts - last < max(BOT_REPLY_COOLDOWN_SECONDS, 0):
+        return True
+    _LAST_REPLY_BY_CHAT[chat_id] = now_ts
+    return False
+
+
 def _extract_whatsapp_text(payload: Any) -> Dict[str, Any]:
     """
     Extrai texto e remetente de payloads comuns do MESSAGES_UPSERT.
@@ -185,11 +203,11 @@ def _extract_whatsapp_text(payload: Any) -> Dict[str, Any]:
         or _get(payload, "remoteJid")
         or ""
     )
-    from_me = bool(
-        _get(data, "key.fromMe")
-        or _get(payload, "data.key.fromMe")
-        or False
-    )
+    from_me_raw = _get(data, "key.fromMe")
+    if from_me_raw is None:
+        from_me_raw = _get(payload, "data.key.fromMe")
+    has_from_me = from_me_raw is not None
+    from_me = bool(from_me_raw) if has_from_me else False
     from_group = bool("-" in str(remote_jid))
 
     text = (
@@ -220,13 +238,18 @@ def _extract_whatsapp_text(payload: Any) -> Dict[str, Any]:
                 text = str(text or "")
             text = text.strip()
             remote_jid = remote_jid or _get(first, "key.remoteJid") or ""
-            from_me = from_me or bool(_get(first, "key.fromMe") or False)
+            if not has_from_me:
+                first_from_me = _get(first, "key.fromMe")
+                if first_from_me is not None:
+                    has_from_me = True
+                    from_me = bool(first_from_me)
             from_group = bool("-" in str(remote_jid))
 
     return {
         "text": text,
         "remote_jid": str(remote_jid or ""),
         "from_me": from_me,
+        "has_from_me": has_from_me,
         "from_group": from_group,
     }
 
@@ -287,11 +310,18 @@ async def _maybe_auto_reply_whatsapp(payload: Any) -> bool:
     if not BOT_AUTO_REPLY:
         return False
     msg = _extract_whatsapp_text(payload)
-    if msg["from_me"] or msg["from_group"]:
+    # Regra de segurança:
+    # - só responde quando fromMe vier explícito e for False
+    # - nunca responde grupos/status/broadcast
+    if not msg["has_from_me"] or msg["from_me"] or msg["from_group"]:
         return False
     text = msg["text"]
     remote_jid = msg["remote_jid"]
     if not text or not remote_jid:
+        return False
+    if not _is_private_jid(remote_jid):
+        return False
+    if _chat_on_cooldown(remote_jid):
         return False
     reply = _build_auto_reply(text)
     if not reply:
