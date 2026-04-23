@@ -17,6 +17,11 @@ TOKEN_WHATSAPP = os.getenv("WEBHOOK_TOKEN_WHATSAPP", "")
 TOKEN_IFOOD = os.getenv("WEBHOOK_TOKEN_IFOOD", "")
 TOKEN_99FOOD = os.getenv("WEBHOOK_TOKEN_99FOOD", "")
 
+EVOLUTION_BASE_URL = os.getenv("EVOLUTION_BASE_URL", "").rstrip("/")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "")
+BOT_AUTO_REPLY = os.getenv("BOT_AUTO_REPLY", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 STATUS_MAP = {
     "novo": "recebido",
     "new": "recebido",
@@ -146,6 +151,155 @@ def _extract_items(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         preco = _to_float(item.get("p") or item.get("preco") or item.get("price") or 0, 0)
         itens.append({"n": nome, "q": max(qtd, 1), "p": max(preco, 0.0)})
     return itens
+
+
+def _normalize_jid_to_number(jid: str) -> str:
+    if not jid:
+        return ""
+    base = jid.split("@")[0]
+    digits = "".join(ch for ch in base if ch.isdigit())
+    return digits
+
+
+def _extract_whatsapp_text(payload: Any) -> Dict[str, Any]:
+    """
+    Extrai texto e remetente de payloads comuns do MESSAGES_UPSERT.
+    Retorna dict com:
+      text, remote_jid, from_me, from_group
+    """
+    if not isinstance(payload, dict):
+        return {
+            "text": "",
+            "remote_jid": "",
+            "from_me": False,
+            "from_group": False,
+        }
+
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    key = _get(data, "key") if isinstance(_get(data, "key"), dict) else {}
+    message = _get(data, "message") if isinstance(_get(data, "message"), dict) else {}
+
+    remote_jid = (
+        _get(data, "key.remoteJid")
+        or _get(payload, "data.key.remoteJid")
+        or _get(payload, "remoteJid")
+        or ""
+    )
+    from_me = bool(
+        _get(data, "key.fromMe")
+        or _get(payload, "data.key.fromMe")
+        or False
+    )
+    from_group = bool("-" in str(remote_jid))
+
+    text = (
+        _get(data, "message.conversation")
+        or _get(data, "message.extendedTextMessage.text")
+        or _get(data, "message.imageMessage.caption")
+        or _get(data, "message.videoMessage.caption")
+        or _get(payload, "text")
+        or _get(payload, "message")
+        or ""
+    )
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = text.strip()
+
+    # Alguns payloads trazem lista de mensagens
+    if not text:
+        msgs = _get(payload, "data.messages")
+        if isinstance(msgs, list) and msgs:
+            first = msgs[0] if isinstance(msgs[0], dict) else {}
+            text = (
+                _get(first, "message.conversation")
+                or _get(first, "message.extendedTextMessage.text")
+                or _get(first, "message.imageMessage.caption")
+                or ""
+            )
+            if not isinstance(text, str):
+                text = str(text or "")
+            text = text.strip()
+            remote_jid = remote_jid or _get(first, "key.remoteJid") or ""
+            from_me = from_me or bool(_get(first, "key.fromMe") or False)
+            from_group = bool("-" in str(remote_jid))
+
+    return {
+        "text": text,
+        "remote_jid": str(remote_jid or ""),
+        "from_me": from_me,
+        "from_group": from_group,
+    }
+
+
+def _build_auto_reply(text: str) -> str:
+    t = (text or "").strip().lower()
+    if not t:
+        return ""
+    if any(k in t for k in ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite"]):
+        return (
+            "Paz! Seja bem-vindo ao Maná do Céu. 🍱\n"
+            "Posso te ajudar com:\n"
+            "1) Cardápio do dia\n"
+            "2) Fazer pedido\n"
+            "3) Taxa/tempo de entrega\n\n"
+            "Responda com 1, 2 ou 3."
+        )
+    if t in {"1", "cardapio", "cardápio", "menu"}:
+        return (
+            "Cardápio base:\n"
+            "- Marmitex 1 carne: R$ 17,00\n"
+            "- Marmitex 2 carnes: R$ 20,00\n"
+            "- Econômica: R$ 15,00\n\n"
+            "Se quiser pedir, digite: *quero pedir*"
+        )
+    if t in {"2", "quero pedir", "pedido"}:
+        return (
+            "Perfeito! Me envie neste formato:\n"
+            "Nome + Endereço + Bairro + Itens\n\n"
+            "Exemplo:\n"
+            "Maria, Rua X 123, Setor Sul, 2 marmitex 1 carne."
+        )
+    if t in {"3", "taxa", "entrega", "frete"}:
+        return "A taxa depende do bairro. Me informe seu bairro que eu te retorno taxa e tempo. 🚚"
+    return (
+        "Recebi sua mensagem. 🙌\n"
+        "Digite *menu* para ver opções ou *quero pedir* para começar o pedido."
+    )
+
+
+async def _send_evolution_text(number: str, text: str) -> bool:
+    if not EVOLUTION_BASE_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+        return False
+    if not number or not text:
+        return False
+    url = f"{EVOLUTION_BASE_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {
+        "apikey": EVOLUTION_API_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {"number": number, "text": text}
+    async with httpx.AsyncClient(timeout=20) as client:
+        resp = await client.post(url, headers=headers, json=payload)
+    return resp.status_code < 300
+
+
+async def _maybe_auto_reply_whatsapp(payload: Any) -> bool:
+    if not BOT_AUTO_REPLY:
+        return False
+    msg = _extract_whatsapp_text(payload)
+    if msg["from_me"] or msg["from_group"]:
+        return False
+    text = msg["text"]
+    remote_jid = msg["remote_jid"]
+    if not text or not remote_jid:
+        return False
+    reply = _build_auto_reply(text)
+    if not reply:
+        return False
+    number = _normalize_jid_to_number(remote_jid)
+    if not number:
+        return False
+    return await _send_evolution_text(number, reply)
 
 
 def _build_pedido_row(payload: Dict[str, Any], canal: str) -> Dict[str, Any]:
@@ -313,11 +467,33 @@ async def webhook_whatsapp(
     try:
         _validate_token("wpp", x_webhook_token)
         payload = await request.json()
-        return await _handle_order_webhook("wpp", payload)
+        if not isinstance(payload, dict):
+            return WebhookResult(
+                ok=True,
+                canal="wpp",
+                action="ignored",
+                message="Payload whatsapp ignorado por formato inválido.",
+            )
+        replied = await _maybe_auto_reply_whatsapp(payload)
+        order_res = await _handle_order_webhook("wpp", payload)
+        if order_res.action == "ignored" and replied:
+            return WebhookResult(
+                ok=True,
+                canal="wpp",
+                action="replied",
+                message="Mensagem recebida e resposta enviada via Evolution.",
+            )
+        return order_res
     except HTTPException:
         raise
     except Exception as err:
-        raise HTTPException(status_code=500, detail=f"Erro interno webhook whatsapp: {err}")
+        # Evita loop de retry no Evolution em caso de payload inesperado.
+        return WebhookResult(
+            ok=False,
+            canal="wpp",
+            action="error",
+            message=f"Erro interno webhook whatsapp: {err}",
+        )
 
 
 @app.post("/webhook/ifood", response_model=WebhookResult)
